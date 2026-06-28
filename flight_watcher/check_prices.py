@@ -2,17 +2,19 @@
 """
 Daily flight-price watcher: Beirut (BEY) -> Mexico City (MEX), round trip.
 
-Searches the Amadeus Flight Offers Search API for each candidate departure date,
-keeps only offers that satisfy the user's constraints (1 stop, connecting via
-Paris/CDG or Istanbul/IST, journey under N hours each direction), records the
-cheapest valid offer per day to price_history.json, prints prices in USD + MXN,
-and emits a BUY signal when today's best price is the lowest in >= 14 days.
+Default data source is KEYLESS (the `fast-flights` library, which reads Google
+Flights) so the watcher runs with zero account setup. If Amadeus Self-Service
+API credentials are present in the environment, it uses those instead (more
+precise, official). Either way it:
 
-Requires two environment variables (set them as GitHub Actions secrets):
-  AMADEUS_CLIENT_ID
-  AMADEUS_CLIENT_SECRET
+  * searches each candidate departure date (return = departure + stay_days),
+  * keeps only offers with 1 stop via Paris (CDG) or Istanbul (IST) and a
+    flight time under the configured limit,
+  * records the cheapest valid fare per day to price_history.json (USD + MXN),
+  * emits a BUY signal when today's best fare is the lowest in >= 14 days.
 
-Get free credentials at https://developers.amadeus.com (Self-Service).
+Optional Amadeus credentials (set as GitHub Actions secrets):
+  AMADEUS_CLIENT_ID, AMADEUS_CLIENT_SECRET
 """
 
 import json
@@ -29,14 +31,11 @@ CONFIG_PATH = os.path.join(HERE, "config.json")
 HISTORY_PATH = os.path.join(HERE, "price_history.json")
 LATEST_PATH = os.path.join(HERE, "latest_result.json")
 
-# Amadeus "production" host. The free Self-Service tier works here once the app
-# is moved to production in the developer portal. For the test sandbox swap to
-# "test.api.amadeus.com".
 AMADEUS_HOST = os.environ.get("AMADEUS_HOST", "api.amadeus.com")
 
 
 # --------------------------------------------------------------------------- #
-# Small helpers
+# Helpers
 # --------------------------------------------------------------------------- #
 def load_json(path, default):
     try:
@@ -44,14 +43,6 @@ def load_json(path, default):
             return json.load(fh)
     except (FileNotFoundError, json.JSONDecodeError):
         return default
-
-
-def http_post_form(url, data):
-    body = urlparse.urlencode(data).encode()
-    req = urlrequest.Request(url, data=body, method="POST")
-    req.add_header("Content-Type", "application/x-www-form-urlencoded")
-    with urlrequest.urlopen(req, timeout=60) as resp:
-        return json.loads(resp.read().decode())
 
 
 def http_get_json(url, headers=None, timeout=60):
@@ -62,101 +53,134 @@ def http_get_json(url, headers=None, timeout=60):
         return json.loads(resp.read().decode())
 
 
+def http_post_form(url, data):
+    body = urlparse.urlencode(data).encode()
+    req = urlrequest.Request(url, data=body, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    with urlrequest.urlopen(req, timeout=60) as resp:
+        return json.loads(resp.read().decode())
+
+
 def iso_duration_to_hours(text):
-    """'PT19H30M' -> 19.5 (hours, as float)."""
+    """'PT19H30M' -> 19.5"""
     m = re.match(r"PT(?:(\d+)H)?(?:(\d+)M)?", text or "")
     if not m:
         return None
-    hours = int(m.group(1) or 0)
-    minutes = int(m.group(2) or 0)
-    return hours + minutes / 60.0
+    return int(m.group(1) or 0) + int(m.group(2) or 0) / 60.0
+
+
+# Normalised record shape returned by every backend:
+#   {price, currency, via, carriers, out_hours, ret_hours}
+def make_record(price, currency, via_codes, carriers, out_hours, ret_hours):
+    return {
+        "price": float(price),
+        "currency": currency,
+        "via": "/".join(via_codes) if via_codes else "?",
+        "carriers": sorted(set(carriers)),
+        "out_hours": round(out_hours, 1) if out_hours is not None else None,
+        "ret_hours": round(ret_hours, 1) if ret_hours is not None else None,
+    }
 
 
 # --------------------------------------------------------------------------- #
-# Amadeus access
+# Backend 1: keyless (fast-flights / Google Flights)
 # --------------------------------------------------------------------------- #
-def amadeus_token(client_id, client_secret):
-    url = f"https://{AMADEUS_HOST}/v1/security/oauth2/token"
+def fastflights_best(cfg, dep, ret):
+    from fast_flights import FlightQuery, Passengers, create_query, get_flights
+
+    max_stops = cfg["max_stops_each_direction"]
+    allowed = set(cfg["allowed_connection_airports"])
+    max_minutes = cfg["max_journey_hours_each_direction"] * 60
+    seat = cfg["cabin"].lower().replace("_", "-")
+
+    query = create_query(
+        flights=[
+            FlightQuery(date=dep, from_airport=cfg["origin"],
+                        to_airport=cfg["destination"], max_stops=max_stops),
+            FlightQuery(date=ret, from_airport=cfg["destination"],
+                        to_airport=cfg["origin"], max_stops=max_stops),
+        ],
+        seat=seat, trip="round-trip",
+        passengers=Passengers(adults=cfg["passengers"]),
+        currency="USD",
+    )
+    result = get_flights(query)
+
+    best = None
+    for opt in result:
+        segs = getattr(opt, "flights", []) or []
+        if len(segs) - 1 < 1 or len(segs) - 1 > max_stops:
+            continue
+        conns = [s.to_airport.code for s in segs[:-1]]
+        if not all(c in allowed for c in conns):
+            continue
+        flight_minutes = sum((s.duration or 0) for s in segs)
+        if flight_minutes <= 0 or flight_minutes > max_minutes:
+            continue
+        price = float(getattr(opt, "price", 0) or 0)
+        if price <= 0:
+            continue
+        rec = make_record(price, "USD", conns, getattr(opt, "airlines", []),
+                          flight_minutes / 60.0, None)
+        if best is None or price < best["price"]:
+            best = rec
+    return best
+
+
+# --------------------------------------------------------------------------- #
+# Backend 2: Amadeus (optional, precise, filters both legs)
+# --------------------------------------------------------------------------- #
+def amadeus_token(cid, secret):
     payload = http_post_form(
-        url,
-        {
-            "grant_type": "client_credentials",
-            "client_id": client_id,
-            "client_secret": client_secret,
-        },
+        f"https://{AMADEUS_HOST}/v1/security/oauth2/token",
+        {"grant_type": "client_credentials", "client_id": cid,
+         "client_secret": secret},
     )
     return payload["access_token"]
 
 
-def search_offers(token, origin, dest, dep_date, ret_date, adults, cabin, currency):
-    params = {
-        "originLocationCode": origin,
-        "destinationLocationCode": dest,
-        "departureDate": dep_date,
-        "returnDate": ret_date,
-        "adults": str(adults),
-        "travelClass": cabin,
-        "currencyCode": currency,
-        "max": "50",
-        "nonStop": "false",
-    }
-    url = f"https://{AMADEUS_HOST}/v2/shopping/flight-offers?" + urlparse.urlencode(params)
-    data = http_get_json(url, headers={"Authorization": f"Bearer {token}"})
-    return data.get("data", [])
-
-
-# --------------------------------------------------------------------------- #
-# Constraint filtering
-# --------------------------------------------------------------------------- #
-def itinerary_ok(itin, cfg):
-    """Return (ok, journey_hours, connection_codes) for one direction."""
-    segments = itin.get("segments", [])
-    stops = len(segments) - 1
+def _amadeus_itin_ok(itin, cfg):
+    segs = itin.get("segments", [])
+    stops = len(segs) - 1
     if stops < 1 or stops > cfg["max_stops_each_direction"]:
         return False, None, []
-
-    # connection airport(s) = every arrival point except the final destination
-    connections = [s["arrival"]["iataCode"] for s in segments[:-1]]
-    allowed = set(cfg["allowed_connection_airports"])
-    if not all(code in allowed for code in connections):
-        return False, None, connections
-
-    journey_hours = iso_duration_to_hours(itin.get("duration"))
-    if journey_hours is None or journey_hours > cfg["max_journey_hours_each_direction"]:
-        return False, journey_hours, connections
-
-    return True, journey_hours, connections
+    conns = [s["arrival"]["iataCode"] for s in segs[:-1]]
+    if not all(c in set(cfg["allowed_connection_airports"]) for c in conns):
+        return False, None, conns
+    hours = iso_duration_to_hours(itin.get("duration"))
+    if hours is None or hours > cfg["max_journey_hours_each_direction"]:
+        return False, hours, conns
+    return True, hours, conns
 
 
-def best_valid_offer(offers, cfg):
-    """Pick the cheapest offer whose outbound AND return both pass constraints."""
+def amadeus_best(cfg, dep, ret, token):
+    params = {
+        "originLocationCode": cfg["origin"], "destinationLocationCode": cfg["destination"],
+        "departureDate": dep, "returnDate": ret, "adults": str(cfg["passengers"]),
+        "travelClass": cfg["cabin"], "currencyCode": "USD", "max": "50", "nonStop": "false",
+    }
+    url = f"https://{AMADEUS_HOST}/v2/shopping/flight-offers?" + urlparse.urlencode(params)
+    offers = http_get_json(url, headers={"Authorization": f"Bearer {token}"}).get("data", [])
+
     best = None
     for offer in offers:
         itins = offer.get("itineraries", [])
         if len(itins) != 2:
             continue
-        out_ok, out_h, out_conn = itinerary_ok(itins[0], cfg)
-        ret_ok, ret_h, ret_conn = itinerary_ok(itins[1], cfg)
-        if not (out_ok and ret_ok):
+        ok_o, h_o, c_o = _amadeus_itin_ok(itins[0], cfg)
+        ok_r, h_r, c_r = _amadeus_itin_ok(itins[1], cfg)
+        if not (ok_o and ok_r):
             continue
         price = float(offer["price"]["grandTotal"])
-        carriers = sorted({s["carrierCode"] for it in itins for s in it["segments"]})
-        record = {
-            "price": price,
-            "currency": offer["price"]["currency"],
-            "outbound_hours": round(out_h, 1),
-            "return_hours": round(ret_h, 1),
-            "outbound_via": out_conn,
-            "return_via": ret_conn,
-            "carriers": carriers,
-        }
+        carriers = [s["carrierCode"] for it in itins for s in it["segments"]]
+        rec = make_record(price, "USD", c_o + c_r, carriers, h_o, h_r)
         if best is None or price < best["price"]:
-            best = record
+            best = rec
     return best
 
 
 # --------------------------------------------------------------------------- #
-# FX: USD -> MXN (free endpoint, no key; falls back to an approximate rate)
+# FX: USD -> MXN (free, no key; falls back to an approximate rate)
 # --------------------------------------------------------------------------- #
 def usd_to_mxn_rate():
     try:
@@ -166,11 +190,11 @@ def usd_to_mxn_rate():
             return float(rate), "live"
     except (HTTPError, URLError, ValueError, KeyError):
         pass
-    return 18.5, "fallback (~18.5, live rate unavailable)"
+    return 18.5, "fallback (~18.5)"
 
 
 # --------------------------------------------------------------------------- #
-# GitHub Actions output plumbing
+# GitHub Actions plumbing
 # --------------------------------------------------------------------------- #
 def emit_output(key, value):
     out = os.environ.get("GITHUB_OUTPUT")
@@ -191,44 +215,36 @@ def write_summary(md):
 # --------------------------------------------------------------------------- #
 def main():
     cfg = load_json(CONFIG_PATH, {})
-    client_id = os.environ.get("AMADEUS_CLIENT_ID")
-    client_secret = os.environ.get("AMADEUS_CLIENT_SECRET")
-    if not client_id or not client_secret:
-        print("ERROR: set AMADEUS_CLIENT_ID and AMADEUS_CLIENT_SECRET "
-              "(GitHub repo Settings -> Secrets -> Actions).", file=sys.stderr)
-        sys.exit(2)
+    cid = os.environ.get("AMADEUS_CLIENT_ID")
+    secret = os.environ.get("AMADEUS_CLIENT_SECRET")
+    use_amadeus = bool(cid and secret)
+    token = amadeus_token(cid, secret) if use_amadeus else None
+    backend = "Amadeus" if use_amadeus else "keyless (Google Flights)"
+    print(f"Data source: {backend}")
 
-    token = amadeus_token(client_id, client_secret)
     stay = timedelta(days=cfg["stay_days"])
-
-    overall = None
-    overall_meta = {}
+    overall, overall_meta = None, {}
     for dep in cfg["departure_candidates"]:
         ret = (datetime.strptime(dep, "%Y-%m-%d").date() + stay).isoformat()
         try:
-            offers = search_offers(
-                token, cfg["origin"], cfg["destination"], dep, ret,
-                cfg["passengers"], cfg["cabin"], cfg["currency_primary"],
-            )
-        except (HTTPError, URLError) as exc:
-            print(f"  {dep} -> {ret}: query failed ({exc})", file=sys.stderr)
+            best = (amadeus_best(cfg, dep, ret, token) if use_amadeus
+                    else fastflights_best(cfg, dep, ret))
+        except Exception as exc:  # network/parse hiccup on one date shouldn't kill the run
+            print(f"  {dep} -> {ret}: lookup failed ({type(exc).__name__}: {exc})", file=sys.stderr)
             continue
-        best = best_valid_offer(offers, cfg)
         if best:
-            print(f"  {dep} -> {ret}: cheapest valid "
-                  f"{best['currency']} {best['price']:.0f} "
-                  f"via {best['outbound_via']}/{best['return_via']} "
-                  f"({best['outbound_hours']}h / {best['return_hours']}h)")
+            hrs = f"{best['out_hours']}h" + (f"/{best['ret_hours']}h" if best['ret_hours'] else "")
+            print(f"  {dep} -> {ret}: USD {best['price']:.0f} via {best['via']} ({hrs})")
             if overall is None or best["price"] < overall["price"]:
-                overall = best
-                overall_meta = {"departure": dep, "return": ret}
+                overall, overall_meta = best, {"departure": dep, "return": ret}
         else:
             print(f"  {dep} -> {ret}: no offer met the constraints")
 
     if overall is None:
-        print("No valid offers found across any candidate date today.", file=sys.stderr)
+        print("No valid offers found today.", file=sys.stderr)
         write_summary("### ✈️ Flight watcher\nNo offers met the constraints today.")
         emit_output("buy_signal", "false")
+        emit_output("price_usd", "")
         sys.exit(0)
 
     rate, rate_src = usd_to_mxn_rate()
@@ -236,8 +252,7 @@ def main():
     price_mxn = round(price_usd * rate)
 
     today = date.today().isoformat()
-    history = load_json(HISTORY_PATH, [])
-    history = [h for h in history if h["date"] != today]  # idempotent for same day
+    history = [h for h in load_json(HISTORY_PATH, []) if h["date"] != today]
     history.append({
         "date": today,
         "price_usd": round(price_usd, 2),
@@ -245,10 +260,11 @@ def main():
         "fx_usd_mxn": round(rate, 3),
         "departure": overall_meta["departure"],
         "return": overall_meta["return"],
-        "via": f"{overall['outbound_via']}/{overall['return_via']}",
+        "via": overall["via"],
         "carriers": overall["carriers"],
-        "hours_out": overall["outbound_hours"],
-        "hours_ret": overall["return_hours"],
+        "hours_out": overall["out_hours"],
+        "hours_ret": overall["ret_hours"],
+        "source": backend,
     })
     history.sort(key=lambda h: h["date"])
     with open(HISTORY_PATH, "w") as fh:
@@ -257,39 +273,34 @@ def main():
     prices = [h["price_usd"] for h in history]
     all_time_low = min(prices)
     is_new_low = price_usd <= all_time_low
-    enough_history = len(history) >= cfg["buy_signal"]["min_history_days"]
-    buy_signal = bool(is_new_low and enough_history)
+    enough = len(history) >= cfg["buy_signal"]["min_history_days"]
+    buy_signal = bool(is_new_low and enough)
 
-    # Console + result file
+    hrs = f"{overall['out_hours']}h out" + (f" / {overall['ret_hours']}h back" if overall['ret_hours'] else " (flight time)")
     print("\n=== BEST TODAY ===")
-    print(f"Route   : BEY -> MEX -> BEY, via {overall['outbound_via']}/{overall['return_via']}")
+    print(f"Route   : BEY -> MEX -> BEY via {overall['via']}")
     print(f"Dates   : depart {overall_meta['departure']}, return {overall_meta['return']}")
     print(f"Airlines: {', '.join(overall['carriers'])}")
-    print(f"Journey : {overall['outbound_hours']}h out / {overall['return_hours']}h back")
+    print(f"Time    : {hrs}")
     print(f"Price   : USD {price_usd:,.0f}  |  MXN {price_mxn:,}  (FX {rate:.2f}, {rate_src})")
     print(f"History : {len(history)} day(s), all-time low USD {all_time_low:,.0f}")
-    print(f"BUY     : {'YES — lowest in 2+ weeks' if buy_signal else ('new low (need 14d history)' if is_new_low else 'no')}")
+    print(f"BUY     : {'YES — lowest in 2+ weeks' if buy_signal else ('new low (need 14d)' if is_new_low else 'no')}")
 
-    result = {
-        "date": today,
-        "price_usd": round(price_usd, 2),
-        "price_mxn": price_mxn,
-        "buy_signal": buy_signal,
-        "is_new_low": is_new_low,
-        "all_time_low_usd": round(all_time_low, 2),
-        "history_days": len(history),
-        "details": overall,
-        "departure": overall_meta["departure"],
-        "return": overall_meta["return"],
-    }
     with open(LATEST_PATH, "w") as fh:
-        json.dump(result, fh, indent=2)
+        json.dump({
+            "date": today, "price_usd": round(price_usd, 2), "price_mxn": price_mxn,
+            "buy_signal": buy_signal, "is_new_low": is_new_low,
+            "all_time_low_usd": round(all_time_low, 2), "history_days": len(history),
+            "via": overall["via"], "carriers": overall["carriers"],
+            "departure": overall_meta["departure"], "return": overall_meta["return"],
+            "source": backend,
+        }, fh, indent=2)
 
-    # GitHub Actions outputs / summary
     emit_output("buy_signal", "true" if buy_signal else "false")
+    emit_output("is_new_low", "true" if is_new_low else "false")
     emit_output("price_usd", f"{price_usd:.0f}")
     emit_output("price_mxn", f"{price_mxn}")
-    emit_output("via", f"{overall['outbound_via']}/{overall['return_via']}")
+    emit_output("via", overall["via"])
     emit_output("dep_date", overall_meta["departure"])
     emit_output("ret_date", overall_meta["return"])
     emit_output("low_usd", f"{all_time_low:.0f}")
@@ -297,16 +308,16 @@ def main():
     emit_output("carriers", ", ".join(overall["carriers"]))
 
     flag = "🟢 **BUY — lowest in 2+ weeks**" if buy_signal else (
-        "🔵 new low (need ≥14 days of history first)" if is_new_low else "—")
+        "🔵 new low (need ≥14 days first)" if is_new_low else "—")
     write_summary(
         f"### ✈️ Flight watcher — {today}\n"
         f"| Field | Value |\n|---|---|\n"
         f"| Best price | **USD {price_usd:,.0f}** / **MXN {price_mxn:,}** |\n"
-        f"| Route | BEY→MEX→BEY via {overall['outbound_via']}/{overall['return_via']} |\n"
+        f"| Route | BEY→MEX→BEY via {overall['via']} |\n"
         f"| Dates | {overall_meta['departure']} → {overall_meta['return']} |\n"
         f"| Airlines | {', '.join(overall['carriers'])} |\n"
-        f"| Journey | {overall['outbound_hours']}h out / {overall['return_hours']}h back |\n"
-        f"| All-time low | USD {all_time_low:,.0f} ({len(history)} days tracked) |\n"
+        f"| All-time low | USD {all_time_low:,.0f} ({len(history)} days) |\n"
+        f"| Source | {backend} |\n"
         f"| Signal | {flag} |\n"
     )
 

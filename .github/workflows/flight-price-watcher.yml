@@ -10,7 +10,7 @@ on:
 
 permissions:
   contents: write   # commit the updated price_history.json
-  issues: write     # open a BUY-signal issue that notifies you
+  issues: write     # maintain the tracker issue + buy alert (emails/pushes you)
 
 concurrency:
   group: flight-watcher
@@ -20,8 +20,10 @@ jobs:
   check:
     runs-on: ubuntu-latest
     env:
-      # Set these as repo secrets to enable email (see README). If unset, the
-      # email step is skipped and the GitHub issue still fires on a buy signal.
+      # Optional Amadeus upgrade (more precise). Leave unset to use the keyless source.
+      AMADEUS_CLIENT_ID: ${{ secrets.AMADEUS_CLIENT_ID }}
+      AMADEUS_CLIENT_SECRET: ${{ secrets.AMADEUS_CLIENT_SECRET }}
+      # Optional daily email. Leave unset to rely on the GitHub tracker issue.
       MAIL_USERNAME: ${{ secrets.MAIL_USERNAME }}
       MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
       MAIL_TO: ${{ secrets.MAIL_TO }}
@@ -32,11 +34,11 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install dependencies
+        run: pip install -r flight_watcher/requirements.txt
+
       - name: Check flight prices
         id: check
-        env:
-          AMADEUS_CLIENT_ID: ${{ secrets.AMADEUS_CLIENT_ID }}
-          AMADEUS_CLIENT_SECRET: ${{ secrets.AMADEUS_CLIENT_SECRET }}
         run: python flight_watcher/check_prices.py
 
       - name: Commit updated price history
@@ -51,7 +53,69 @@ jobs:
             git push
           fi
 
-      - name: Email the daily price (and buy alert)
+      - name: Update tracker issue & notify
+        if: steps.check.outputs.price_usd != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const r = JSON.parse(fs.readFileSync('flight_watcher/latest_result.json', 'utf8'));
+            const hist = JSON.parse(fs.readFileSync('flight_watcher/price_history.json', 'utf8'));
+            const { owner, repo } = context.repo;
+            const LABEL = 'flight-watcher';
+
+            const recent = hist.slice(-14).reverse()
+              .map(h => `| ${h.date} | USD ${Math.round(h.price_usd)} | MXN ${h.price_mxn} | ${h.via} | ${h.departure}→${h.return} |`)
+              .join('\n');
+            const body = [
+              `### ✈️ Beirut → Mexico City — round-trip price tracker`,
+              ``,
+              `**Latest (${r.date}): USD ${r.price_usd} / MXN ${r.price_mxn}** via ${r.via}`,
+              `All-time low: USD ${r.all_time_low_usd} · days tracked: ${r.history_days} · source: ${r.source}`,
+              ``,
+              `Buy rule: alert when today's fare is the lowest in ≥14 days. ` +
+              (r.buy_signal ? `**🟢 BUY now.**` : (r.history_days < 14 ? `(building history…)` : `Not yet — keep waiting.`)),
+              ``,
+              `| Date | USD | MXN | Via | Trip |`,
+              `|---|---|---|---|---|`,
+              recent,
+              ``,
+              `_Updated automatically each day. Full data: flight_watcher/price_history.json_`,
+            ].join('\n');
+
+            // find or create the tracker issue
+            const found = await github.rest.issues.listForRepo({
+              owner, repo, state: 'open', labels: LABEL, per_page: 1 });
+            let issue = found.data[0];
+            if (!issue) {
+              const created = await github.rest.issues.create({
+                owner, repo, title: '✈️ BEY→MEX price tracker (Sep 2026)',
+                body, labels: [LABEL] });
+              issue = created.data;
+            } else {
+              await github.rest.issues.update({ owner, repo, issue_number: issue.number, body });
+            }
+
+            // notify (comment) only on a buy signal or a new all-time low
+            if (r.buy_signal || r.is_new_low) {
+              const head = r.buy_signal
+                ? `## 🟢 BUY NOW — lowest price in 2+ weeks`
+                : `## 🔵 New low so far`;
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: issue.number,
+                body: [
+                  head, ``,
+                  `**USD ${r.price_usd} / MXN ${r.price_mxn}** — BEY→MEX→BEY via ${r.via}`,
+                  `Dates: depart ${r.departure}, return ${r.return} · airlines: ${r.carriers.join(', ')}`,
+                  r.buy_signal ? `\nThis is your cue to book. Close this issue once you have.` : ``,
+                ].join('\n') });
+              if (r.buy_signal) {
+                await github.rest.issues.addLabels({ owner, repo, issue_number: issue.number,
+                  labels: ['buy-signal'] });
+              }
+            }
+
+      - name: Email the daily price (optional)
         if: env.MAIL_USERNAME != '' && steps.check.outputs.price_usd != ''
         uses: dawidd6/action-send-mail@v3
         with:
@@ -75,34 +139,3 @@ jobs:
             Airlines     : ${{ steps.check.outputs.carriers }}
             Dates        : depart ${{ steps.check.outputs.dep_date }}, return ${{ steps.check.outputs.ret_date }}
             All-time low : USD ${{ steps.check.outputs.low_usd }}  (${{ steps.check.outputs.hist_days }} days tracked)
-
-            Trend: https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/flight_watcher/price_history.json
-
-      - name: Open BUY-signal issue
-        if: steps.check.outputs.buy_signal == 'true'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const usd = "${{ steps.check.outputs.price_usd }}";
-            const mxn = "${{ steps.check.outputs.price_mxn }}";
-            const via = "${{ steps.check.outputs.via }}";
-            const dep = "${{ steps.check.outputs.dep_date }}";
-            const ret = "${{ steps.check.outputs.ret_date }}";
-            const title = `🟢 BUY signal — BEY→MEX at USD ${usd} / MXN ${mxn}`;
-            const body = [
-              `**This is the lowest price in 2+ weeks of tracking — time to buy.**`,
-              ``,
-              `- **Price:** USD ${usd} / MXN ${mxn}`,
-              `- **Route:** Beirut → Mexico City → Beirut, one stop via ${via}`,
-              `- **Dates:** depart ${dep}, return ${ret}`,
-              ``,
-              `See \`flight_watcher/price_history.json\` for the full trend.`,
-              `If you've already booked, just close this issue.`,
-            ].join("\n");
-            await github.rest.issues.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title,
-              body,
-              labels: ["flight-watcher", "buy-signal"],
-            });
