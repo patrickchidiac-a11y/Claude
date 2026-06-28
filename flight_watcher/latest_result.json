@@ -1,0 +1,11 @@
+{
+  "date": "2026-06-28",
+  "status": "fetch_failed",
+  "price_usd": null,
+  "price_mxn": null,
+  "days_since_last_price": null,
+  "last_price_date": null,
+  "health_alert": false,
+  "source": "keyless (Google Flights)",
+  "message": "data source unavailable (every lookup errored)"
+}
