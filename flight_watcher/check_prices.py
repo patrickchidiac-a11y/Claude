@@ -264,7 +264,8 @@ def main():
     cfg = load_json(CONFIG_PATH, {})
     cid = os.environ.get("AMADEUS_CLIENT_ID")
     secret = os.environ.get("AMADEUS_CLIENT_SECRET")
-    use_amadeus = bool(cid and secret)
+    amadeus_configured = bool(cid and secret)
+    use_amadeus = amadeus_configured
     token = None
     backend = "keyless (Google Flights)"
     if use_amadeus:
@@ -310,10 +311,17 @@ def main():
 
     # ----- no usable price today: distinguish a broken source from genuine quiet -----
     if overall is None:
-        status = "fetch_failed" if errors == len(candidates) else "no_offers"
-        health_alert = days_since_last is not None and days_since_last >= max_stale
-        msg = ("data source unavailable (every lookup errored)"
-               if status == "fetch_failed" else "no offers met the constraints")
+        if not amadeus_configured:
+            # No price feed set up yet — this is a setup state, not a fault.
+            status = "awaiting_setup"
+            health_alert = False
+            msg = ("Amadeus API key not configured yet — add AMADEUS_CLIENT_ID and "
+                   "AMADEUS_CLIENT_SECRET in repo Settings → Secrets (see README)")
+        else:
+            status = "fetch_failed" if errors == len(candidates) else "no_offers"
+            health_alert = days_since_last is not None and days_since_last >= max_stale
+            msg = ("data source unavailable (every lookup errored)"
+                   if status == "fetch_failed" else "no offers met the constraints")
         print(f"\nNo price recorded today: {msg}.", file=sys.stderr)
         # Always write latest_result (with today's date) so the tracker can show
         # staleness and the daily commit keeps the schedule alive.
