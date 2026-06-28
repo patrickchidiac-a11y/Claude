@@ -85,6 +85,30 @@ def make_record(price, currency, via_codes, carriers, out_hours, ret_hours):
 # --------------------------------------------------------------------------- #
 # Backend 1: keyless (fast-flights / Google Flights)
 # --------------------------------------------------------------------------- #
+# Google shows datacenter IPs an EU cookie-consent interstitial that lacks the
+# results script, which makes the default fetcher crash. We fetch ourselves with
+# a consent-bypass cookie + US/English locale, then hand the HTML to the parser.
+def _ff_fetch_results(query):
+    import primp
+    from fast_flights.parser import parse
+    from fast_flights.fetcher import URL
+
+    client = primp.Client(impersonate="chrome_145", impersonate_os="windows",
+                          referer=True, cookie_store=True)
+    params = {**query.params(), "hl": "en", "gl": "US"}
+    cookies = {"CONSENT": "YES+1", "SOCS": "CAISEwgDEgk"}
+    res = client.get(URL, params=params, cookies=cookies, follow_redirects=True)
+    html = res.text or ""
+    status = getattr(res, "status_code", "?")
+    has_results_script = "ds:1" in html
+    if not has_results_script:
+        snippet = " ".join(html.split())[:200]
+        raise RuntimeError(
+            f"no results script in page (HTTP {status}, {len(html)} bytes). "
+            f"Snippet: {snippet!r}")
+    return parse(html)
+
+
 def fastflights_best(cfg, dep, ret):
     from fast_flights import FlightQuery, Passengers, create_query, get_flights
 
@@ -107,7 +131,12 @@ def fastflights_best(cfg, dep, ret):
         passengers=Passengers(adults=cfg["passengers"]),
         currency="USD",
     )
-    result = get_flights(query)
+    try:
+        result = _ff_fetch_results(query)
+    except Exception as exc:
+        # fall back to the library's default fetcher, then re-raise with context
+        print(f"    consent-bypass fetch failed: {exc}", file=sys.stderr)
+        result = get_flights(query)
 
     best = None
     for opt in result:

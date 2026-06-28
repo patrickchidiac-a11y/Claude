@@ -48,7 +48,7 @@ jobs:
         run: |
           git config user.name  "flight-watcher-bot"
           git config user.email "actions@github.com"
-          git add flight_watcher/price_history.json flight_watcher/latest_result.json
+          git add flight_watcher/price_history.json flight_watcher/latest_result.json 2>/dev/null || true
           if git diff --cached --quiet; then
             echo "No price changes to commit."
           else
