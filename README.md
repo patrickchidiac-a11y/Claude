@@ -4,8 +4,8 @@ A daily watcher that tracks the round-trip economy fare from **Beirut (BEY)** to
 **Mexico City (MEX)** for your dad's September visit, and tells you when to buy.
 
 It runs as a **scheduled GitHub Action** (on GitHub's servers, every day), so it
-keeps working long after this chat session ends — and it works **with zero
-account setup**.
+keeps working long after this chat session ends. It needs one free API key
+(Amadeus) for price data — see setup below.
 
 ## What it watches
 
@@ -39,28 +39,30 @@ USD/MXN price and the full trend.
 > that **Issues** notifications are enabled in the GitHub app, so the alert
 > reaches you.
 
-## Where the prices come from
+## Where the prices come from — Amadeus (required for the GitHub Action)
 
-By default the watcher reads live fares from **Google Flights** via the keyless
-`fast-flights` library — **no API key, no account** — and **restricts the search
-to Turkish Airlines and Air France** (set in `config.json` → `airlines`). These
-are the same fares those carriers sell on their own sites for the Istanbul/Paris
-one-stop routing, but pulled reliably instead of scraping airline websites
-(which block automated access). Round-trip search filters on the outbound leg's
-stop/connection/flight-time; the round-trip price is what you'd actually pay.
+The watcher uses the **Amadeus Self-Service flight API** (free tier). This is an
+official API that works reliably from GitHub's servers and restricts results to
+**Turkish Airlines and Air France** (`config.json` → `airlines`), filtering both
+legs for the 1-stop Paris/Istanbul routing under 25h.
 
-This keyless source is best-effort: on a day Google rate-limits the runner, that
-day may be skipped (the buy logic tolerates gaps). For a rock-solid, official
-feed you can optionally switch to Amadeus — see below.
+Set it up once (~3 minutes):
+1. Free account at <https://developers.amadeus.com> → confirm email → sign in.
+2. **My Self-Service Apps → Create new app** → copy the **API Key** and **API Secret**.
+3. **Move the app to Production** (button on the app page) so it returns real,
+   current fares. The Test environment only has limited/cached data.
+4. In this repo: **Settings → Secrets and variables → Actions → New repository secret**:
+   - `AMADEUS_CLIENT_ID` = your API Key
+   - `AMADEUS_CLIENT_SECRET` = your API Secret
+5. **Actions → Flight Price Watcher → Run workflow** to confirm. It then runs daily.
 
-## Optional upgrades
+> Keep the keys only in GitHub Secrets — never paste them into code or chat.
 
-### Amadeus (more precise, filters both legs)
-1. Free account at <https://developers.amadeus.com> → create an app → copy the
-   **API Key** + **Secret**, move the app to **Production**.
-2. Add repo secrets (**Settings → Secrets and variables → Actions**):
-   `AMADEUS_CLIENT_ID`, `AMADEUS_CLIENT_SECRET`. The watcher uses Amadeus
-   automatically when these are present.
+### Note on the keyless fallback
+The repo also contains a keyless `fast-flights` (Google Flights) path used only
+when no Amadeus keys are set. **It does not work from GitHub's runners** — Google
+blocks datacenter IPs with a consent page — so it's useful only when you run the
+script from your own machine/residential IP. Amadeus is the supported path.
 
 ### A dedicated daily email (in addition to the GitHub alert)
 Use Gmail SMTP with an app password:
