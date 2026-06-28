@@ -19,6 +19,7 @@
   "buy_signal": {
     "strategy": "lowest_in_window",
     "min_history_days": 14,
-    "note": "Trigger BUY when we have >=14 days of history AND today's best price is the lowest ever recorded."
+    "window_days": 14,
+    "note": "Trigger BUY when we have >=14 days of history AND today's best price is the lowest seen in the trailing window_days window (i.e. lowest in 2+ weeks)."
   }
 }

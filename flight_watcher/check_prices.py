@@ -307,8 +307,15 @@ def main():
     prices = [h["price_usd"] for h in history]
     all_time_low = min(prices)
     is_new_low = price_usd <= all_time_low
+    # "Lowest in 2+ weeks" = lowest within the trailing window (by date, so gaps
+    # from skipped days don't distort it), once we have enough history.
+    window_days = cfg["buy_signal"].get("window_days", 14)
+    cutoff = (date.today() - timedelta(days=window_days)).isoformat()
+    window_prices = [h["price_usd"] for h in history if h["date"] >= cutoff]
+    window_low = min(window_prices) if window_prices else price_usd
+    is_window_low = price_usd <= window_low
     enough = len(history) >= cfg["buy_signal"]["min_history_days"]
-    buy_signal = bool(is_new_low and enough)
+    buy_signal = bool(is_window_low and enough)
 
     hrs = f"{overall['out_hours']}h out" + (f" / {overall['ret_hours']}h back" if overall['ret_hours'] else " (flight time)")
     print("\n=== BEST TODAY ===")
