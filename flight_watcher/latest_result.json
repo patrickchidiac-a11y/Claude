@@ -1,11 +1,11 @@
 {
   "date": "2026-06-28",
-  "status": "fetch_failed",
+  "status": "awaiting_setup",
   "price_usd": null,
   "price_mxn": null,
   "days_since_last_price": null,
   "last_price_date": null,
   "health_alert": false,
   "source": "keyless (Google Flights)",
-  "message": "data source unavailable (every lookup errored)"
+  "message": "Amadeus API key not configured yet \u2014 add AMADEUS_CLIENT_ID and AMADEUS_CLIENT_SECRET in repo Settings \u2192 Secrets (see README)"
 }
