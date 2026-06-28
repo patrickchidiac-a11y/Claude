@@ -2,6 +2,9 @@ name: Flight Price Watcher (BEY -> MEX)
 
 # Runs daily and can be triggered manually from the Actions tab.
 on:
+  push:
+    branches: [claude/flight-price-watcher-lebanon-mexico-17ohcj]
+    paths: ['.github/workflows/flight-price-watcher.yml', 'flight_watcher/**']
   schedule:
     # 13:17 UTC daily (off-peak minute on purpose). GitHub may delay scheduled
     # runs under load; exact timing is not guaranteed.
