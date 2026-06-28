@@ -92,13 +92,16 @@ def fastflights_best(cfg, dep, ret):
     allowed = set(cfg["allowed_connection_airports"])
     max_minutes = cfg["max_journey_hours_each_direction"] * 60
     seat = cfg["cabin"].lower().replace("_", "-")
+    airlines = cfg.get("airlines") or None  # e.g. ["TK", "AF"]; None = any airline
 
     query = create_query(
         flights=[
             FlightQuery(date=dep, from_airport=cfg["origin"],
-                        to_airport=cfg["destination"], max_stops=max_stops),
+                        to_airport=cfg["destination"], max_stops=max_stops,
+                        airlines=airlines),
             FlightQuery(date=ret, from_airport=cfg["destination"],
-                        to_airport=cfg["origin"], max_stops=max_stops),
+                        to_airport=cfg["origin"], max_stops=max_stops,
+                        airlines=airlines),
         ],
         seat=seat, trip="round-trip",
         passengers=Passengers(adults=cfg["passengers"]),
@@ -159,6 +162,8 @@ def amadeus_best(cfg, dep, ret, token):
         "departureDate": dep, "returnDate": ret, "adults": str(cfg["passengers"]),
         "travelClass": cfg["cabin"], "currencyCode": "USD", "max": "50", "nonStop": "false",
     }
+    if cfg.get("airlines"):
+        params["includedAirlineCodes"] = ",".join(cfg["airlines"])
     url = f"https://{AMADEUS_HOST}/v2/shopping/flight-offers?" + urlparse.urlencode(params)
     offers = http_get_json(url, headers={"Authorization": f"Bearer {token}"}).get("data", [])
 

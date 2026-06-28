@@ -12,6 +12,7 @@ account setup**.
 | Setting | Value |
 |---|---|
 | Route | BEY → MEX → BEY, round trip |
+| Airlines | **Turkish Airlines (via Istanbul)** and **Air France (via Paris)** only |
 | Stops | exactly **1**, connecting via **Paris (CDG)** or **Istanbul (IST)** |
 | Max flight time | **< 25 h** |
 | Passengers / cabin | 1, economy |
@@ -41,9 +42,12 @@ USD/MXN price and the full trend.
 ## Where the prices come from
 
 By default the watcher reads live fares from **Google Flights** via the keyless
-`fast-flights` library — **no API key, no account**. Round-trip search filters on
-the outbound leg's stop/connection/flight-time; the round-trip price is what
-you'd actually pay.
+`fast-flights` library — **no API key, no account** — and **restricts the search
+to Turkish Airlines and Air France** (set in `config.json` → `airlines`). These
+are the same fares those carriers sell on their own sites for the Istanbul/Paris
+one-stop routing, but pulled reliably instead of scraping airline websites
+(which block automated access). Round-trip search filters on the outbound leg's
+stop/connection/flight-time; the round-trip price is what you'd actually pay.
 
 This keyless source is best-effort: on a day Google rate-limits the runner, that
 day may be skipped (the buy logic tolerates gaps). For a rock-solid, official

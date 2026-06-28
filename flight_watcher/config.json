@@ -11,6 +11,8 @@
   "departure_candidates": ["2026-09-01", "2026-09-03", "2026-09-06"],
 
   "allowed_connection_airports": ["CDG", "IST"],
+  "airlines": ["TK", "AF"],
+  "_airlines_note": "Restrict the search to these carriers only. TK = Turkish Airlines (via Istanbul), AF = Air France (via Paris). Leave empty [] to allow any airline.",
   "max_stops_each_direction": 1,
   "max_journey_hours_each_direction": 25,
 
