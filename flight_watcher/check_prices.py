@@ -71,6 +71,12 @@ def iso_duration_to_hours(text):
 
 # Normalised record shape returned by every backend:
 #   {price, currency, via, carriers, out_hours, ret_hours}
+def plausible_price(cfg, price):
+    """Guard against a mis-scraped or wrong-currency figure."""
+    lo, hi = cfg.get("plausible_usd", [0, 10**9])
+    return lo <= price <= hi
+
+
 def make_record(price, currency, via_codes, carriers, out_hours, ret_hours):
     return {
         "price": float(price),
@@ -150,7 +156,7 @@ def fastflights_best(cfg, dep, ret):
         if flight_minutes <= 0 or flight_minutes > max_minutes:
             continue
         price = float(getattr(opt, "price", 0) or 0)
-        if price <= 0:
+        if not plausible_price(cfg, price):
             continue
         rec = make_record(price, "USD", conns, getattr(opt, "airlines", []),
                           flight_minutes / 60.0, None)
@@ -206,6 +212,8 @@ def amadeus_best(cfg, dep, ret, token):
         if not (ok_o and ok_r):
             continue
         price = float(offer["price"]["grandTotal"])
+        if not plausible_price(cfg, price):
+            continue
         carriers = [s["carrierCode"] for it in itins for s in it["segments"]]
         rec = make_record(price, "USD", c_o + c_r, carriers, h_o, h_r)
         if best is None or price < best["price"]:
@@ -244,6 +252,11 @@ def write_summary(md):
             fh.write(md + "\n")
 
 
+def write_latest(obj):
+    with open(LATEST_PATH, "w") as fh:
+        json.dump(obj, fh, indent=2)
+
+
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
@@ -252,19 +265,40 @@ def main():
     cid = os.environ.get("AMADEUS_CLIENT_ID")
     secret = os.environ.get("AMADEUS_CLIENT_SECRET")
     use_amadeus = bool(cid and secret)
-    token = amadeus_token(cid, secret) if use_amadeus else None
-    backend = "Amadeus" if use_amadeus else "keyless (Google Flights)"
+    token = None
+    backend = "keyless (Google Flights)"
+    if use_amadeus:
+        try:
+            token = amadeus_token(cid, secret)
+            backend = "Amadeus"
+        except Exception as exc:  # don't let lapsed creds kill the watcher
+            print(f"Amadeus auth failed ({type(exc).__name__}: {exc}); "
+                  f"falling back to keyless source.", file=sys.stderr)
+            use_amadeus = False
     print(f"Data source: {backend}")
 
+    today = date.today()
+    today_str = today.isoformat()
+    history_all = [h for h in load_json(HISTORY_PATH, []) if h.get("date")]
+    prior = [h for h in history_all if h["date"] < today_str]
+    prev = max(prior, key=lambda h: h["date"]) if prior else None
+    last_price_date = prev["date"] if prev else None
+    days_since_last = ((today - date.fromisoformat(last_price_date)).days
+                       if last_price_date else None)
+    max_stale = cfg.get("health", {}).get("max_stale_days", 3)
+
     stay = timedelta(days=cfg["stay_days"])
-    overall, overall_meta = None, {}
-    for dep in cfg["departure_candidates"]:
+    candidates = cfg["departure_candidates"]
+    overall, overall_meta, errors = None, {}, 0
+    for dep in candidates:
         ret = (datetime.strptime(dep, "%Y-%m-%d").date() + stay).isoformat()
         try:
             best = (amadeus_best(cfg, dep, ret, token) if use_amadeus
                     else fastflights_best(cfg, dep, ret))
-        except Exception as exc:  # network/parse hiccup on one date shouldn't kill the run
-            print(f"  {dep} -> {ret}: lookup failed ({type(exc).__name__}: {exc})", file=sys.stderr)
+        except Exception as exc:  # a hiccup on one date shouldn't kill the run
+            errors += 1
+            print(f"  {dep} -> {ret}: lookup failed ({type(exc).__name__}: {exc})",
+                  file=sys.stderr)
             continue
         if best:
             hrs = f"{best['out_hours']}h" + (f"/{best['ret_hours']}h" if best['ret_hours'] else "")
@@ -274,24 +308,44 @@ def main():
         else:
             print(f"  {dep} -> {ret}: no offer met the constraints")
 
+    # ----- no usable price today: distinguish a broken source from genuine quiet -----
     if overall is None:
-        print("No valid offers found today.", file=sys.stderr)
-        write_summary("### ✈️ Flight watcher\nNo offers met the constraints today.")
-        emit_output("buy_signal", "false")
+        status = "fetch_failed" if errors == len(candidates) else "no_offers"
+        health_alert = days_since_last is not None and days_since_last >= max_stale
+        msg = ("data source unavailable (every lookup errored)"
+               if status == "fetch_failed" else "no offers met the constraints")
+        print(f"\nNo price recorded today: {msg}.", file=sys.stderr)
+        # Always write latest_result (with today's date) so the tracker can show
+        # staleness and the daily commit keeps the schedule alive.
+        write_latest({
+            "date": today_str, "status": status, "price_usd": None, "price_mxn": None,
+            "days_since_last_price": days_since_last, "last_price_date": last_price_date,
+            "health_alert": health_alert, "source": backend, "message": msg,
+        })
+        emit_output("status", status)
         emit_output("price_usd", "")
-        sys.exit(0)
+        emit_output("buy_signal", "false")
+        emit_output("should_notify", "false")
+        emit_output("health_alert", "true" if health_alert else "false")
+        emit_output("days_since_last", "" if days_since_last is None else str(days_since_last))
+        warn = (f" ⚠️ **No price recorded for {days_since_last} days — the watcher may be broken.**"
+                if health_alert else "")
+        write_summary(f"### ✈️ Flight watcher — {today_str}\nNo price: {msg}.{warn}")
+        return
 
+    # ----- have a price -----
     rate, rate_src = usd_to_mxn_rate()
+    fx_approx = "fallback" in rate_src
     price_usd = overall["price"]
     price_mxn = round(price_usd * rate)
 
-    today = date.today().isoformat()
-    history = [h for h in load_json(HISTORY_PATH, []) if h["date"] != today]
-    history.append({
-        "date": today,
+    history = [h for h in history_all if h["date"] != today_str]
+    record = {
+        "date": today_str,
         "price_usd": round(price_usd, 2),
         "price_mxn": price_mxn,
         "fx_usd_mxn": round(rate, 3),
+        "fx_source": rate_src,
         "departure": overall_meta["departure"],
         "return": overall_meta["return"],
         "via": overall["via"],
@@ -299,23 +353,48 @@ def main():
         "hours_out": overall["out_hours"],
         "hours_ret": overall["ret_hours"],
         "source": backend,
-    })
+    }
+    history.append(record)
     history.sort(key=lambda h: h["date"])
-    with open(HISTORY_PATH, "w") as fh:
-        json.dump(history, fh, indent=2)
 
     prices = [h["price_usd"] for h in history]
     all_time_low = min(prices)
     is_new_low = price_usd <= all_time_low
-    # "Lowest in 2+ weeks" = lowest within the trailing window (by date, so gaps
-    # from skipped days don't distort it), once we have enough history.
+
+    # "Lowest in 2+ weeks": lowest within the trailing window, and the window must
+    # be backed by >= min_history_days of CALENDAR coverage (not just data points).
     window_days = cfg["buy_signal"].get("window_days", 14)
-    cutoff = (date.today() - timedelta(days=window_days)).isoformat()
-    window_prices = [h["price_usd"] for h in history if h["date"] >= cutoff]
-    window_low = min(window_prices) if window_prices else price_usd
+    min_days = cfg["buy_signal"]["min_history_days"]
+    cutoff = (today - timedelta(days=window_days)).isoformat()
+    window = [h for h in history if h["date"] >= cutoff]
+    wprices = [h["price_usd"] for h in window]
+    window_low = min(wprices)
     is_window_low = price_usd <= window_low
-    enough = len(history) >= cfg["buy_signal"]["min_history_days"]
-    buy_signal = bool(is_window_low and enough)
+    span_days = (today - date.fromisoformat(history[0]["date"])).days
+    enough = span_days >= min_days
+
+    # Optional "trending up" qualifier: recent half of the window above the earlier half.
+    trending_up = None
+    if len(wprices) >= 4:
+        half = len(wprices) // 2
+        earlier = sum(wprices[:half]) / half
+        recent = sum(wprices[half:]) / (len(wprices) - half)
+        trending_up = recent > earlier
+    require_trend = cfg["buy_signal"].get("require_trending_up", False)
+    trend_ok = (trending_up is not False) if require_trend else True
+
+    buy_signal = bool(is_window_low and enough and trend_ok)
+    record["buy_signal"] = buy_signal
+    record["is_new_low"] = is_new_low
+    with open(HISTORY_PATH, "w") as fh:
+        json.dump(history, fh, indent=2)
+
+    # Push a notification only on an actionable BUY — when we first enter the buy
+    # state, or while in it the price drops further. Never every day at the floor,
+    # and not on pre-14-day "new lows" (those just show in the tracker issue body).
+    was_buy = bool(prev and prev.get("buy_signal"))
+    strict_drop = prev is None or price_usd < prev["price_usd"]
+    should_notify = bool(buy_signal and (not was_buy or strict_drop))
 
     hrs = f"{overall['out_hours']}h out" + (f" / {overall['ret_hours']}h back" if overall['ret_hours'] else " (flight time)")
     print("\n=== BEST TODAY ===")
@@ -324,21 +403,30 @@ def main():
     print(f"Airlines: {', '.join(overall['carriers'])}")
     print(f"Time    : {hrs}")
     print(f"Price   : USD {price_usd:,.0f}  |  MXN {price_mxn:,}  (FX {rate:.2f}, {rate_src})")
-    print(f"History : {len(history)} day(s), all-time low USD {all_time_low:,.0f}")
-    print(f"BUY     : {'YES — lowest in 2+ weeks' if buy_signal else ('new low (need 14d)' if is_new_low else 'no')}")
+    print(f"History : {len(history)} day(s) over {span_days} day(s), all-time low USD {all_time_low:,.0f}")
+    print(f"BUY     : {'YES — lowest in 2+ weeks' if buy_signal else ('new low' if is_new_low else 'no')}"
+          + (f" | trending_up={trending_up}" if trending_up is not None else ""))
 
-    with open(LATEST_PATH, "w") as fh:
-        json.dump({
-            "date": today, "price_usd": round(price_usd, 2), "price_mxn": price_mxn,
-            "buy_signal": buy_signal, "is_new_low": is_new_low,
-            "all_time_low_usd": round(all_time_low, 2), "history_days": len(history),
-            "via": overall["via"], "carriers": overall["carriers"],
-            "departure": overall_meta["departure"], "return": overall_meta["return"],
-            "source": backend,
-        }, fh, indent=2)
+    write_latest({
+        "date": today_str, "status": "ok",
+        "price_usd": round(price_usd, 2), "price_mxn": price_mxn,
+        "fx_usd_mxn": round(rate, 3), "fx_source": rate_src, "fx_approx": fx_approx,
+        "buy_signal": buy_signal, "is_new_low": is_new_low, "should_notify": should_notify,
+        "trending_up": trending_up,
+        "all_time_low_usd": round(all_time_low, 2), "window_low_usd": round(window_low, 2),
+        "history_days": len(history), "span_days": span_days,
+        "days_since_last_price": 0, "health_alert": False,
+        "via": overall["via"], "carriers": overall["carriers"],
+        "departure": overall_meta["departure"], "return": overall_meta["return"],
+        "source": backend,
+    })
 
+    emit_output("status", "ok")
     emit_output("buy_signal", "true" if buy_signal else "false")
     emit_output("is_new_low", "true" if is_new_low else "false")
+    emit_output("should_notify", "true" if should_notify else "false")
+    emit_output("health_alert", "false")
+    emit_output("fx_approx", "true" if fx_approx else "false")
     emit_output("price_usd", f"{price_usd:.0f}")
     emit_output("price_mxn", f"{price_mxn}")
     emit_output("via", overall["via"])
@@ -349,15 +437,16 @@ def main():
     emit_output("carriers", ", ".join(overall["carriers"]))
 
     flag = "🟢 **BUY — lowest in 2+ weeks**" if buy_signal else (
-        "🔵 new low (need ≥14 days first)" if is_new_low else "—")
+        "🔵 new low" if is_new_low else "—")
+    mxn_note = " _(approx — live FX unavailable)_" if fx_approx else ""
     write_summary(
-        f"### ✈️ Flight watcher — {today}\n"
+        f"### ✈️ Flight watcher — {today_str}\n"
         f"| Field | Value |\n|---|---|\n"
-        f"| Best price | **USD {price_usd:,.0f}** / **MXN {price_mxn:,}** |\n"
+        f"| Best price | **USD {price_usd:,.0f}** / **MXN {price_mxn:,}**{mxn_note} |\n"
         f"| Route | BEY→MEX→BEY via {overall['via']} |\n"
         f"| Dates | {overall_meta['departure']} → {overall_meta['return']} |\n"
         f"| Airlines | {', '.join(overall['carriers'])} |\n"
-        f"| All-time low | USD {all_time_low:,.0f} ({len(history)} days) |\n"
+        f"| All-time low | USD {all_time_low:,.0f} ({len(history)} days over {span_days}d) |\n"
         f"| Source | {backend} |\n"
         f"| Signal | {flag} |\n"
     )

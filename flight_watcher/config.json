@@ -16,10 +16,19 @@
   "max_stops_each_direction": 1,
   "max_journey_hours_each_direction": 25,
 
+  "plausible_usd": [300, 6000],
+  "_plausible_note": "Sanity band for a round-trip BEY<->MEX economy fare. Offers priced outside this range are skipped (guards against a mis-scraped or wrong-currency price).",
+
   "buy_signal": {
     "strategy": "lowest_in_window",
     "min_history_days": 14,
     "window_days": 14,
-    "note": "Trigger BUY when we have >=14 days of history AND today's best price is the lowest seen in the trailing window_days window (i.e. lowest in 2+ weeks)."
+    "require_trending_up": false,
+    "note": "BUY when the span of history is >= min_history_days calendar days AND today's price is the lowest in the trailing window_days window (lowest in 2+ weeks). If require_trending_up is true, also require recent prices to be rising."
+  },
+
+  "health": {
+    "max_stale_days": 3,
+    "note": "If no price has been recorded for this many days, surface a WATCHER-MAY-BE-BROKEN alert instead of silently looking like 'no good price yet'."
   }
 }
