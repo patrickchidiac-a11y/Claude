@@ -54,6 +54,26 @@ The price data comes from the **Amadeus Self-Service API**, which has a free tie
 > This watcher commits its price history daily, which counts as activity and
 > keeps the schedule alive on its own.
 
+## Email notifications (optional)
+
+You get the buy alert two ways: the GitHub issue (above) **and** email. The email
+step sends you a message **every day** with the current price in USD + MXN, and
+when it's a buy the subject starts with **"🟢 BUY NOW"**.
+
+To enable it, use Gmail SMTP with an app password:
+
+1. Turn on 2-Step Verification on your Google account, then create an
+   **App Password**: <https://myaccount.google.com/apppasswords> (pick "Mail").
+2. Add three repo secrets (**Settings → Secrets and variables → Actions**):
+   - `MAIL_USERNAME` = your Gmail address (e.g. `patrickchidiac@gmail.com`)
+   - `MAIL_PASSWORD` = the 16-character app password (not your normal password)
+   - `MAIL_TO` = where to send alerts (e.g. `patrickchidiac@gmail.com`)
+
+If these secrets are absent, the email step is simply skipped — the GitHub issue
+buy alert still works. Don't want a daily email? Change the email step's `if:`
+condition in the workflow to `steps.check.outputs.buy_signal == 'true'` to get
+mail only on a buy.
+
 ## Run it locally (optional)
 
 ```bash

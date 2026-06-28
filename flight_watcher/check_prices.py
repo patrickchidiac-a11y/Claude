@@ -292,6 +292,9 @@ def main():
     emit_output("via", f"{overall['outbound_via']}/{overall['return_via']}")
     emit_output("dep_date", overall_meta["departure"])
     emit_output("ret_date", overall_meta["return"])
+    emit_output("low_usd", f"{all_time_low:.0f}")
+    emit_output("hist_days", f"{len(history)}")
+    emit_output("carriers", ", ".join(overall["carriers"]))
 
     flag = "🟢 **BUY — lowest in 2+ weeks**" if buy_signal else (
         "🔵 new low (need ≥14 days of history first)" if is_new_low else "—")

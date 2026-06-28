@@ -19,6 +19,12 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
+    env:
+      # Set these as repo secrets to enable email (see README). If unset, the
+      # email step is skipped and the GitHub issue still fires on a buy signal.
+      MAIL_USERNAME: ${{ secrets.MAIL_USERNAME }}
+      MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
+      MAIL_TO: ${{ secrets.MAIL_TO }}
     steps:
       - uses: actions/checkout@v4
 
@@ -44,6 +50,33 @@ jobs:
             git commit -m "flight watcher: ${{ steps.check.outputs.dep_date }} fare USD ${{ steps.check.outputs.price_usd }} / MXN ${{ steps.check.outputs.price_mxn }}"
             git push
           fi
+
+      - name: Email the daily price (and buy alert)
+        if: env.MAIL_USERNAME != '' && steps.check.outputs.price_usd != ''
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ env.MAIL_USERNAME }}
+          password: ${{ env.MAIL_PASSWORD }}
+          from: Flight Watcher <${{ env.MAIL_USERNAME }}>
+          to: ${{ env.MAIL_TO }}
+          subject: >-
+            ${{ steps.check.outputs.buy_signal == 'true' && '🟢 BUY NOW — ' || '✈️ ' }}BEY→MEX
+            USD ${{ steps.check.outputs.price_usd }} / MXN ${{ steps.check.outputs.price_mxn }}
+          body: |
+            ${{ steps.check.outputs.buy_signal == 'true' && '*** LOWEST PRICE IN 2+ WEEKS — TIME TO BUY ***' || 'Daily flight price check' }}
+
+            Beirut (BEY) -> Mexico City (MEX), round trip, economy
+            Best fare today: USD ${{ steps.check.outputs.price_usd }}  |  MXN ${{ steps.check.outputs.price_mxn }}
+
+            One stop via : ${{ steps.check.outputs.via }}
+            Airlines     : ${{ steps.check.outputs.carriers }}
+            Dates        : depart ${{ steps.check.outputs.dep_date }}, return ${{ steps.check.outputs.ret_date }}
+            All-time low : USD ${{ steps.check.outputs.low_usd }}  (${{ steps.check.outputs.hist_days }} days tracked)
+
+            Trend: https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/flight_watcher/price_history.json
 
       - name: Open BUY-signal issue
         if: steps.check.outputs.buy_signal == 'true'
