@@ -1,0 +1,75 @@
+name: Flight Price Watcher (BEY -> MEX)
+
+# Runs daily and can be triggered manually from the Actions tab.
+on:
+  schedule:
+    # 13:17 UTC daily (off-peak minute on purpose). GitHub may delay scheduled
+    # runs under load; exact timing is not guaranteed.
+    - cron: "17 13 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # commit the updated price_history.json
+  issues: write     # open a BUY-signal issue that notifies you
+
+concurrency:
+  group: flight-watcher
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check flight prices
+        id: check
+        env:
+          AMADEUS_CLIENT_ID: ${{ secrets.AMADEUS_CLIENT_ID }}
+          AMADEUS_CLIENT_SECRET: ${{ secrets.AMADEUS_CLIENT_SECRET }}
+        run: python flight_watcher/check_prices.py
+
+      - name: Commit updated price history
+        run: |
+          git config user.name  "flight-watcher-bot"
+          git config user.email "actions@github.com"
+          git add flight_watcher/price_history.json flight_watcher/latest_result.json
+          if git diff --cached --quiet; then
+            echo "No price changes to commit."
+          else
+            git commit -m "flight watcher: ${{ steps.check.outputs.dep_date }} fare USD ${{ steps.check.outputs.price_usd }} / MXN ${{ steps.check.outputs.price_mxn }}"
+            git push
+          fi
+
+      - name: Open BUY-signal issue
+        if: steps.check.outputs.buy_signal == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const usd = "${{ steps.check.outputs.price_usd }}";
+            const mxn = "${{ steps.check.outputs.price_mxn }}";
+            const via = "${{ steps.check.outputs.via }}";
+            const dep = "${{ steps.check.outputs.dep_date }}";
+            const ret = "${{ steps.check.outputs.ret_date }}";
+            const title = `🟢 BUY signal — BEY→MEX at USD ${usd} / MXN ${mxn}`;
+            const body = [
+              `**This is the lowest price in 2+ weeks of tracking — time to buy.**`,
+              ``,
+              `- **Price:** USD ${usd} / MXN ${mxn}`,
+              `- **Route:** Beirut → Mexico City → Beirut, one stop via ${via}`,
+              `- **Dates:** depart ${dep}, return ${ret}`,
+              ``,
+              `See \`flight_watcher/price_history.json\` for the full trend.`,
+              `If you've already booked, just close this issue.`,
+            ].join("\n");
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body,
+              labels: ["flight-watcher", "buy-signal"],
+            });

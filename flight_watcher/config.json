@@ -1,0 +1,22 @@
+{
+  "origin": "BEY",
+  "destination": "MEX",
+  "passengers": 1,
+  "cabin": "ECONOMY",
+  "currency_primary": "USD",
+  "currency_secondary": "MXN",
+
+  "stay_days": 25,
+  "_dates_note": "Event is Sep 11-17. Margin: arrive >=5 days before the 11th (by ~Sep 6) and/or stay >=5 days after the 17th. With a ~25-day stay, every candidate below lands him before the event and returns well after it. Flexible — edit freely.",
+  "departure_candidates": ["2026-09-01", "2026-09-03", "2026-09-06"],
+
+  "allowed_connection_airports": ["CDG", "IST"],
+  "max_stops_each_direction": 1,
+  "max_journey_hours_each_direction": 25,
+
+  "buy_signal": {
+    "strategy": "lowest_in_window",
+    "min_history_days": 14,
+    "note": "Trigger BUY when we have >=14 days of history AND today's best price is the lowest ever recorded."
+  }
+}
